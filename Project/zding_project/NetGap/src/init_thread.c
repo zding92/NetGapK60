@@ -1,0 +1,319 @@
+#include <NetGap.h>
+
+
+/*UDPDataStatus indicates the status of the UDP thread, 
+  "waitForUDPData" means it's waiting for UDP data,
+  "UDPDataReadReady" means the UDP thread has received a complete UDP data*/
+unsigned char UDPDataStatus = waitForUDPData;
+
+/*recv_data is the pointer of the array which the UDP-get data is put in*/
+char *recv_data;
+int bytes_read;
+//fileToConfig indicates whether the file in TF is ready to be configured
+bool fileToConfig = false;
+
+extern void udpclient(const char* url, int port, int count);
+char UDPsend_data[] = "UDP Get the Data\n"; /* 发送用到的数据 */
+//===========================================
+extern FRESULT write_txt(char* path);
+//===========================================
+void rt_hw_ksz8041_init(void);
+
+/*线程1入口，线程1为UDP收发处理主线程*/
+void t1_thread_entry(void* parameter)
+{   
+    DelayMs(7000); 
+    GPIO_QuickInit(HW_GPIOE,26, kGPIO_Mode_OPP);//PTE26
+    /*UDP Socket变量*/
+    int sock;
+    
+    
+    rt_uint32_t addr_len;
+    struct sockaddr_in server_addr,client_addr; 
+
+    UART_printf("Entered Thread1\n");    
+	//=============================UDP Socket Building up========================================
+    {      /* 分配接收用的数据缓冲 */
+	    recv_data = rt_malloc(BUFSZ);
+	    if (recv_data == RT_NULL)
+	    {
+	       /* 分配内存失败，返回 */
+	       //rt_kprintf("No memory\n");
+	       UART_printf("No memory\n");
+	       return;
+	    }
+
+	   	/* 创建一个socket，类型是SOCK_DGRAM，UDP类型 */
+	   	if ((sock = socket(AF_INET, SOCK_DGRAM, 17)) == -1)
+	   	{
+	       //rt_kprintf("Socket error\n");
+	       UART_printf("Socket error\n");
+	       /* 释放接收用的数据缓冲 */
+	       rt_free(recv_data);
+	       return;
+	   	}
+
+	   	/* 初始化服务端地址 */
+	   	server_addr.sin_family = AF_INET;
+	   	server_addr.sin_port = htons(localPort);
+	   	server_addr.sin_addr.s_addr = INADDR_ANY;
+	   	rt_memset(&(server_addr.sin_zero),0, sizeof(server_addr.sin_zero));
+
+	   	/* 绑定socket到服务端地址 */
+	   	if (bind(sock,(struct sockaddr *)&server_addr,
+	            sizeof(struct sockaddr)) == -1)
+	   	{
+	       /* 绑定地址失败 */
+	       //rt_kprintf("Bind error\n");
+	       UART_printf("Bind error\n");
+	       /* 释放接收用的数据缓冲 */
+	       rt_free(recv_data);
+	       return;
+	   	}
+
+	   	addr_len = sizeof(struct sockaddr);
+	   	//rt_kprintf("UDPServer Waiting for client on port 5000...\n");
+	   	UART_printf("UDPServer Waiting for client on port %d...\n",localPort);
+	}
+//===========================================================================   
+    while (1)
+    {
+        /* 从sock中收取最大BUFSZ - 1字节数据 */
+        bytes_read = recvfrom(sock, recv_data, BUFSZ - 1, 0,
+                             (struct sockaddr *)&client_addr, &addr_len);
+        /* UDP不同于TCP，它基本不会出现收取的数据失败的情况，除非设置了超时等待 */
+
+        recv_data[bytes_read] = '\0'; /* 把末端清零 */
+        
+        //indicates the UDPData is ready
+        UDPDataStatus = UDPDataReadReady;
+
+        GPIO_ToggleBit(HW_GPIOE, 26);
+
+        /* 输出接收的数据 */
+        UART_printf("\n(%s , %d) said : ",inet_ntoa(client_addr.sin_addr),
+                  ntohs(client_addr.sin_port));
+        UART_printf("%s", recv_data);
+
+        /*在收到UDP数据后，向网络回复"UDP Get the Data\n"表示收到信号 */ 
+        strcpy(UDPsend_data,"UDP Get the Data\n");
+        sendto(sock, UDPsend_data, strlen(UDPsend_data), 0,
+              (struct sockaddr *)&client_addr, sizeof(struct sockaddr));      
+   	}
+}
+
+
+/*线程2入口*/
+void t2_thread_entry(void* parameter)
+{   
+    DelayMs(7000); 
+    UART_printf("Thread2 entered\n");
+    GPIO_QuickInit(HW_GPIOE,27, kGPIO_Mode_OPP);//PTE12
+    while(1)
+    {
+        GPIO_ToggleBit(HW_GPIOE, 27);
+        strcpy(UDPsend_data,"HeartBeat\n");
+        udpclient("172.1.1.144",61018,1);
+        DelayMs(2000);        
+    }
+}
+
+
+/*线程3入口*/
+void t3_thread_entry(void* parameter)
+{   
+    FIL fil;
+    FRESULT rc;
+    
+    FATFS fs_sd;
+    FATFS *fs = &fs_sd;
+    /*挂载文件系统*/
+    f_mount(fs, "0:", 0);   
+    FRESULT res;
+    FILINFO fno;
+    DIR dir;
+    FIL file;
+    char *fn;   /* This function is assuming non-Unicode cfg. */
+    unsigned char writebuff[]="zding txt test\r\n";
+    char readbuff[50];
+    unsigned int ByteWritten;
+    unsigned int ByteRead;
+    
+    unsigned char readBuffPointer;//readbuff的操作指针
+    unsigned char readBuffPartSum = 0;//readbuff逗号之间的每个值的数字值
+    unsigned char commerCnt = 0;
+    
+    
+    UART_printf("Thread 3 entered\r\n");
+    GPIO_QuickInit(HW_GPIOE,28, kGPIO_Mode_OPP);//PTE28
+    
+
+    DelayMs(2000);  
+    //config 0:/config.csv to FPGA
+    configFromTF("0:/config.csv");
+
+    while(1){
+
+        fileToConfig = false;
+        //if a part of the config file get from the UDP data
+        if (UDPDataStatus == UDPDataReadReady){
+            switch(recv_data[0]){
+                //the first char from udp is '!'
+                case '!':
+                    //config 0:/config.csv to FPGA
+                    configFromTF("0:/config.csv");
+                    break;
+                case '#':
+                    res = f_open(&file,"0:/cfgnet.csv",FA_CREATE_ALWAYS|FA_WRITE);
+                    //file open successfully
+                    if (res==FR_OK) {
+                        //if the end of the udp data is '$'
+                        if (recv_data[bytes_read-1]=='$')
+                        {
+                            fileToConfig = true;
+                            //clean the '$' flag
+                            recv_data[bytes_read-1]='\n';
+                        }
+
+                        UART_printf("0:/cfgnet.csv rebuilt\r\n");
+                        // clean the '#' start char
+                        *recv_data = '\n';
+                        //write the recv_data(the data get from UDP) into the file
+                        res=f_write(&file,recv_data,bytes_read,&ByteWritten);
+                        //if write successfully
+                        if (res==FR_OK) {
+                            UART_printf("0:/cfgnet.csv rewritten\r\n");
+                        }
+                        else{
+                            UART_printf("0:/cfgnet.csv rewritten failed for reason of %d\r\n",res);
+                        }
+                        //clean FatFs buff
+                        f_sync(&file);
+                        f_close(&file);
+                        //if the 0:/cfgnet.csv is ready to be configured
+                        if (fileToConfig){
+                            //config 0:/cfgnet.csv to FPGA
+                            configFromTF("0:/cfgnet.csv");
+                        }
+                        
+                    }
+                    else{
+                        UART_printf("file rebuilt failed for reason of %d\r\n",res);
+                    }
+                    break;
+                default:
+                    res = f_open(&file,"0:/cfgnet.csv",FA_OPEN_ALWAYS|FA_WRITE);
+                    if (res==FR_OK) {
+                        UART_printf("0:/cfgnet.csv opened\r\n");
+
+                        //if the end of the udp data is '$'
+                        if (recv_data[bytes_read-1]=='$')
+                        {
+                            fileToConfig = true;
+                            //clean the '$' flag
+                            recv_data[bytes_read-1]='\n';
+                        }
+                        //move file pointer to the end of the file
+                        res = f_lseek(&file, file.fsize);
+                        UART_printf("file size:%d\r\n",file.fsize);
+                        //clean FatFs buff
+                        f_sync(&file);
+                        //write the recv_data(the data get from UDP) into the file
+                        res=f_write(&file,recv_data,bytes_read,&ByteWritten);
+                        f_close(&file);
+                        //if the 0:/cfgnet.csv is ready to be configured
+                        if (fileToConfig){
+                            //config 0:/cfgnet.csv to FPGA
+                            configFromTF("0:/cfgnet.csv");
+                        }
+
+                    }
+                    else{
+                        UART_printf("0:/cfgnet.csv openedt failed for reason of %d\r\n",res);
+                    }
+
+
+            }//switch
+            UDPDataStatus = waitForUDPData;
+        }//if UDPDataStatus == UDPDataReadReady
+
+    }
+}
+/*  RTT 系统的main入口
+    RTT 成功启动后会调用init_thread_entry函数
+*/
+void init_thread_entry(void* parameter)
+{
+    //错误信息
+    rt_err_t err;
+    //入口线程
+    rt_thread_t tid;
+    //第一线程
+    rt_thread_t tid1;
+    //第二线程，心跳线程
+    rt_thread_t tid2;
+    //第三线程，文件读写线程
+    rt_thread_t tid3;
+    //第四线程，Uart配置线程
+    rt_thread_t tid4;
+//===================================Ram Initial=====================================    
+    #ifndef FRDM //如果使用片外RAM时，不定义FRDM
+    SRAM_Init();
+    rt_system_heap_init((void*)(SRAM_ADDRESS_BASE), (void*)(SRAM_ADDRESS_BASE + SRAM_SIZE));
+    #else //使用K60片上RAM，定义FRDM
+    //rt_system_heap_init((void*)(0x1FFF0000), (void*)(0x1FFF0000 + 0x10000));
+    rt_system_heap_init((void*)(0x1FFF0000), (void*)(0x1FFF0000 + 0x10000));
+    #endif 
+//====================================Debug Uart Init================================    
+    rt_thread_delay(1);    
+    rt_hw_uart_init();//串口初始化
+    
+
+//    UART_CallbackRxInstall(HW_UART3, UART_RX_ISR);
+//    UART_ITDMAConfig(HW_UART3, kUART_IT_Rx, true);
+    
+    UART_printf("rt-thread system start!\r\n");
+//====================================Net Initial====================================    
+    rt_hw_ksz8041_init();
+    UART_printf("waitting for connection...\r\n");
+    rt_thread_delay(50); 
+//===============================K60FPGA Uart Init===================================
+    UART_QuickInit(K60FPGA_UartMap,K60FPGA_UartBaudrate);  
+    
+
+//===============================使用FATFS的文件系统=================================
+
+//===================================================================================
+    /*创建线程t1 堆栈大小256 优先级0x24 时间片20ms*/ 
+    tid1 = rt_thread_create("t1", t1_thread_entry, RT_NULL, 512, 0x20, 40);
+    if (tid1 != RT_NULL){
+        rt_thread_startup(tid1);
+        UART_printf("Thread 1 started\r\n");
+    } 
+    
+    tid2 = rt_thread_create("t2", t2_thread_entry, RT_NULL, 512, 0x10, 20);
+    if (tid2 != RT_NULL){
+        rt_thread_startup(tid2);
+        UART_printf("Thread 2 started\r\n");
+    } 
+    
+    tid3 = rt_thread_create("t3", t3_thread_entry, RT_NULL, 8192, 0x25, 500);
+    if (tid3 != RT_NULL){
+        rt_thread_startup(tid3);
+        UART_printf("Thread 3 started\r\n");
+    }
+    
+//    tid4 = rt_thread_create("t4", t4_thread_entry, RT_NULL, 4096, 0x010, 500);
+//    if (tid4 != RT_NULL){
+//        rt_thread_startup(tid4);
+//        UART_printf("Thread 4 started\r\n");
+//    }
+    tid = rt_thread_self();
+    rt_thread_delete(tid); 
+}
+
+
+
+
+
+
